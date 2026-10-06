@@ -1,0 +1,6 @@
+# Ignorar temporales y trabajos de procesamiento
+jobs/*
+temp/*
+!jobs/.gitkeep
+!temp/.gitkeep
+

@@ -1,0 +1,30 @@
+{
+  "2d8f821e-d73b-4aba-bad4-7b9c2443c83d": {
+    "id": "2d8f821e-d73b-4aba-bad4-7b9c2443c83d",
+    "nombre": "Profesor Juan Pérez",
+    "correo": "juan.perez@institucion.edu",
+    "password_hash": "6ad2743cb05239d755fb3d8ba5e9c288$ebfc8c431f33f18efe67401049013271ef0f922341162b736414241a686eaa6d",
+    "created_at": "2026-10-01T14:07:53.420807+00:00"
+  },
+  "39bac352-18bc-4ee9-8bb3-02c9060ecdeb": {
+    "id": "39bac352-18bc-4ee9-8bb3-02c9060ecdeb",
+    "nombre": "Maeva Puente",
+    "correo": "msathiu@gmail.com",
+    "password_hash": "6b62b8958387b2a6f90775e7d843a56d$0b4e6d17cc5a17d9a796e4bf74dd754458bdf760c0186ef37969b0a7f5b507ba",
+    "created_at": "2026-10-01T14:11:11.576377+00:00"
+  },
+  "fec2d066-0bf4-4ace-b879-e025800a2c4b": {
+    "id": "fec2d066-0bf4-4ace-b879-e025800a2c4b",
+    "nombre": "Profesor Tarea 3",
+    "correo": "profesor_tarea3@cenditel.gob.ve",
+    "password_hash": "5e122679f05058197538d705939b4521$30fd4327983e5d5af3cf69bc519869b930bae38acb7c9a6e6a3e6b37cd902bd5",
+    "created_at": "2026-10-01T14:46:17.578578+00:00"
+  },
+  "37d398c5-b0ab-4d68-b19b-cdb2b609cd2b": {
+    "id": "37d398c5-b0ab-4d68-b19b-cdb2b609cd2b",
+    "nombre": "Jose Perez",
+    "correo": "jose@gmail.com",
+    "password_hash": "b86f6175afd1e96aaa56207358dce711$5a4bb782e27621cabfd57862c30fa84ffb80480059ff25b96721b94e2d1366ae",
+    "created_at": "2026-10-02T14:00:03.122739+00:00"
+  }
+}
