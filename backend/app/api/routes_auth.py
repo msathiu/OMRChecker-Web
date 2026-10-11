@@ -1,6 +1,11 @@
 from typing import Optional
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 
+from backend.app.api.deps import (
+    extract_token_from_header,
+    get_current_user,
+    get_current_user_optional,
+)
 from backend.app.schemas.auth import (
     AuthResponse,
     UserLoginRequest,
@@ -12,40 +17,8 @@ from backend.app.services.auth_service import auth_service
 router = APIRouter(prefix="/auth", tags=["Autenticación"])
 
 
-def extract_token_from_header(authorization: Optional[str] = Header(None)) -> Optional[str]:
-    if not authorization:
-        return None
-    parts = authorization.strip().split()
-    if len(parts) == 2 and parts[0].lower() == "bearer":
-        return parts[1]
-    elif len(parts) == 1:
-        return parts[0]
-    return None
-
-
-async def get_current_user(authorization: Optional[str] = Header(None)) -> UserResponse:
-    token = extract_token_from_header(authorization)
-    if not token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="No se proporcionó token de autenticación.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    user = auth_service.get_user_by_token(token)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Sesión inválida o expirada. Por favor inicie sesión nuevamente.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return user
-
-
-async def get_current_user_optional(authorization: Optional[str] = Header(None)) -> Optional[UserResponse]:
-    token = extract_token_from_header(authorization)
-    if not token:
-        return None
-    return auth_service.get_user_by_token(token)
+def _get_client_ip(request: Request) -> str:
+    return request.client.host if request.client else "127.0.0.1"
 
 
 @router.post(
@@ -54,12 +27,13 @@ async def get_current_user_optional(authorization: Optional[str] = Header(None))
     status_code=status.HTTP_201_CREATED,
     summary="Registro de nuevo usuario",
 )
-async def register(req: UserRegisterRequest):
+async def register(req: UserRegisterRequest, request: Request):
     """
     Registra un nuevo usuario con Nombre, Correo institucional y Clave.
+    Por seguridad estricta, no permite registrar usuarios con rol administrador.
     """
     try:
-        user = auth_service.register_user(req)
+        user = auth_service.register_user(req, ip_address=_get_client_ip(request))
         return user
     except ValueError as e:
         raise HTTPException(
@@ -78,12 +52,16 @@ async def register(req: UserRegisterRequest):
     response_model=AuthResponse,
     summary="Inicio de sesión",
 )
-async def login(req: UserLoginRequest):
+async def login(req: UserLoginRequest, request: Request):
     """
     Inicia sesión con correo institucional y clave.
     """
     try:
-        user, token = auth_service.authenticate_user(req.correo, req.clave)
+        user, token = auth_service.authenticate_user(
+            req.correo,
+            req.clave,
+            ip_address=_get_client_ip(request),
+        )
         return AuthResponse(
             token=token,
             user=user,
@@ -105,13 +83,13 @@ async def login(req: UserLoginRequest):
     "/logout",
     summary="Cierre de sesión",
 )
-async def logout(authorization: Optional[str] = Header(None)):
+async def logout(request: Request, authorization: Optional[str] = Header(None)):
     """
     Invalida y elimina la sesión activa del usuario.
     """
     token = extract_token_from_header(authorization)
     if token:
-        auth_service.invalidate_session(token)
+        auth_service.invalidate_session(token, ip_address=_get_client_ip(request))
     return {"message": "Sesión cerrada exitosamente"}
 
 

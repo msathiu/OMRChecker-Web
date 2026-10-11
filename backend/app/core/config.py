@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     USERS_DIR: Path = STORAGE_DIR / "users"
     USERS_FILE: Path = USERS_DIR / "users.json"
     SESSIONS_FILE: Path = USERS_DIR / "sessions.json"
+    DATABASE_PATH: Path = STORAGE_DIR / "omr_web.db"
     SAMPLES_DIR: Path = ROOT_DIR / "samples"
     
     # Reglas de examen estándar OMR
