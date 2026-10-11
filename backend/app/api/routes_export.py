@@ -1,8 +1,10 @@
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse, Response
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 
+from backend.app.api.deps import get_current_user
+from backend.app.schemas.auth import UserResponse
 from backend.app.schemas.omr import BatchProcessResponse
+from backend.app.services.exam_service import exam_service
 from backend.app.services.export_service import export_service
 from backend.app.services.storage_service import storage_service
 
@@ -10,14 +12,17 @@ router = APIRouter(prefix="/export", tags=["Export"])
 
 
 @router.get("/{job_id}/csv")
-async def export_job_csv(job_id: str):
+async def export_job_csv(
+    job_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    exam_service.verify_job_access(job_id, current_user)
     paths = storage_service.get_job_paths(job_id)
     if not paths["root"].exists():
         raise HTTPException(status_code=404, detail=f"Trabajo '{job_id}' no encontrado.")
 
     csv_path = paths["results"] / "results.csv"
     if not csv_path.exists():
-        raise HTTPException(status_code=404, detail="Archivo CSV no encontrado para este trabajo.")
         json_path = paths["results"] / "results.json"
         if json_path.exists():
             with json_path.open("r", encoding="utf-8") as f:
@@ -34,14 +39,17 @@ async def export_job_csv(job_id: str):
 
 
 @router.get("/{job_id}/excel")
-async def export_job_excel(job_id: str):
+async def export_job_excel(
+    job_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    exam_service.verify_job_access(job_id, current_user)
     paths = storage_service.get_job_paths(job_id)
     if not paths["root"].exists():
         raise HTTPException(status_code=404, detail=f"Trabajo '{job_id}' no encontrado.")
 
     xlsx_path = paths["results"] / "results.xlsx"
     if not xlsx_path.exists():
-        raise HTTPException(status_code=404, detail="Archivo Excel no encontrado para este trabajo.")
         json_path = paths["results"] / "results.json"
         if json_path.exists():
             with json_path.open("r", encoding="utf-8") as f:
@@ -58,7 +66,11 @@ async def export_job_excel(job_id: str):
 
 
 @router.get("/{job_id}/json")
-async def export_job_json(job_id: str):
+async def export_job_json(
+    job_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+):
+    exam_service.verify_job_access(job_id, current_user)
     paths = storage_service.get_job_paths(job_id)
     if not paths["root"].exists():
         raise HTTPException(status_code=404, detail=f"Trabajo '{job_id}' no encontrado.")
@@ -72,4 +84,3 @@ async def export_job_json(job_id: str):
         media_type="application/json",
         filename=f"omr_resultados_{job_id[:8]}.json",
     )
-

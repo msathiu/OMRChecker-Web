@@ -4,11 +4,12 @@ import mimetypes
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
-from backend.app.api.routes_auth import get_current_user, get_current_user_optional
+from backend.app.api.deps import get_current_user, get_current_user_optional
 from backend.app.core.config import settings
+from backend.app.db.database import get_db, log_audit
 from backend.app.schemas.auth import UserResponse
 from backend.app.schemas.omr import (
     BatchProcessResponse,
@@ -18,6 +19,7 @@ from backend.app.schemas.omr import (
     SheetResult,
     ZipProcessSummary,
 )
+from backend.app.services.exam_service import exam_service
 from backend.app.services.export_service import export_service
 from backend.app.services.omr_engine_service import omr_engine_service
 from backend.app.services.storage_service import storage_service
@@ -29,14 +31,16 @@ ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".
 
 @router.post("/process", response_model=BatchProcessResponse)
 async def process_omr_sheets(
+    request: Request,
     zip_files: Optional[List[UploadFile]] = File(None, description="Lista de archivos .zip que contienen exámenes OMR"),
     zip_file: Optional[Union[UploadFile, List[UploadFile]]] = File(None, description="Archivo .zip (compatibilidad hacia atrás)"),
+    exam_id: Optional[str] = Form(None, description="ID del examen configurado (obligatorio para rol usuario)"),
     exam_name: Optional[str] = Form("Examen OMR", description="Nombre descriptivo del examen"),
     job_id: Optional[str] = Form(None, description="ID del examen existente para anexar nuevos ZIPs"),
     template: Optional[UploadFile] = File(None, description="Archivo de plantilla (template.json, opcional; estándar por defecto)"),
     evaluation: Optional[UploadFile] = File(None, description="Archivo de evaluación (evaluation.json, opcional)"),
     marker_image: Optional[UploadFile] = File(None, description="Marcador omr_marker.jpg complementario (opcional)"),
-    current_user: Optional[UserResponse] = Depends(get_current_user_optional),
+    current_user: UserResponse = Depends(get_current_user),
 ):
     """
     Procesa uno o múltiples archivos ZIP de hojas de examen OMR en una misma operación.
@@ -72,17 +76,33 @@ async def process_omr_sheets(
                 detail=f"Extensión no permitida para '{f.filename}'. Solo se permiten archivos ZIP (.zip).",
             )
 
-    # 2. Validación de nombre del examen
-    clean_exam_name = "Examen OMR"
-    if exam_name is not None:
-        stripped_name = exam_name.strip()
-        if stripped_name:
-            clean_exam_name = stripped_name
-        elif not job_id:
+    # 2. Validación de nombre del examen y examen configurado
+    clean_exam_id: Optional[str] = exam_id.strip() if exam_id and exam_id.strip() else None
+    eval_bytes_from_db: Optional[bytes] = None
+
+    if current_user.role == "usuario":
+        if not clean_exam_id:
             raise HTTPException(
                 status_code=400,
-                detail="El nombre del examen es obligatorio.",
+                detail="Debe seleccionar un examen configurado por un profesor/editor para realizar la carga.",
             )
+
+    if clean_exam_id:
+        official_name, eval_bytes_from_db, _ = exam_service.get_exam_evaluation_for_processing(
+            clean_exam_id, current_user
+        )
+        clean_exam_name = official_name
+    else:
+        clean_exam_name = "Examen OMR"
+        if exam_name is not None:
+            stripped_name = exam_name.strip()
+            if stripped_name:
+                clean_exam_name = stripped_name
+            elif not job_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="El nombre del examen es obligatorio.",
+                )
 
     # 3. Espacio de trabajo (nuevo o existente para anexar)
     is_appending = False
@@ -105,16 +125,20 @@ async def process_omr_sheets(
                 job_info = json.load(jf)
             if clean_exam_name == "Examen OMR" and job_info.get("exam_name"):
                 clean_exam_name = job_info["exam_name"]
+            if not clean_exam_id and job_info.get("exam_id"):
+                clean_exam_id = job_info["exam_id"]
         except Exception:
             pass
 
     if not job_info:
         job_info = {
             "job_id": actual_job_id,
+            "exam_id": clean_exam_id,
             "exam_name": clean_exam_name,
-            "user_id": current_user.id if current_user else None,
-            "user_email": current_user.correo if current_user else None,
-            "user_name": current_user.nombre if current_user else None,
+            "user_id": current_user.id,
+            "user_email": current_user.correo,
+            "user_name": current_user.nombre,
+            "user_role": current_user.role,
             "status": "processing",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -166,48 +190,60 @@ async def process_omr_sheets(
     # 5. Configurar evaluation (evaluation.json o .csv)
     evaluation_path: Optional[Path] = None
     e_content: Optional[bytes] = None
-    for cand in [paths["root"] / "evaluation.json", paths["root"] / "evaluation.csv"]:
-        if cand.exists():
-            evaluation_path = cand
-            break
 
-    if evaluation and evaluation.filename:
-        e_ext = Path(evaluation.filename).suffix.lower()
-        if e_ext not in {".json", ".csv"}:
-            raise HTTPException(
-                status_code=400,
-                detail=f"El archivo evaluation debe ser .json o .csv (recibido '{evaluation.filename}').",
-            )
-        e_content = await evaluation.read()
-        if not e_content:
-            raise HTTPException(status_code=400, detail="El archivo evaluation subido está vacío.")
-        if e_ext == ".json":
-            try:
-                e_data = json.loads(e_content.decode("utf-8"))
-                if not isinstance(e_data, dict):
-                    raise ValueError("El evaluation debe ser un objeto JSON.")
-                opts = e_data.get("options", {})
-                q_list = opts.get("questions_in_order", [])
-                if isinstance(q_list, list) and len(q_list) > 0:
-                    from src.utils.parsing import parse_fields
-                    parsed_qs = parse_fields("Questions", q_list)
-                    if len(parsed_qs) > settings.MAX_QUESTIONS:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"El examen no puede exceder el límite máximo de {settings.MAX_QUESTIONS} preguntas (recibido {len(parsed_qs)}).",
-                        )
-                    if len(parsed_qs) == 0:
-                        raise HTTPException(
-                            status_code=400,
-                            detail="El archivo de evaluación debe contener al menos 1 pregunta.",
-                        )
-            except HTTPException:
-                raise
-            except Exception as err:
-                raise HTTPException(status_code=400, detail=f"Error al analizar evaluation.json: JSON inválido ({str(err)})")
-        evaluation_path = paths["root"] / f"evaluation{e_ext}"
+    if eval_bytes_from_db:
+        # Carga oficial protegida de la base de datos (según permisos del examen)
+        evaluation_path = paths["root"] / "evaluation.json"
         with evaluation_path.open("wb") as buffer:
-            buffer.write(e_content)
+            buffer.write(eval_bytes_from_db)
+    elif current_user.role == "usuario":
+        raise HTTPException(
+            status_code=400,
+            detail="Debe seleccionar un examen configurado por un profesor/editor para realizar la carga.",
+        )
+    else:
+        for cand in [paths["root"] / "evaluation.json", paths["root"] / "evaluation.csv"]:
+            if cand.exists():
+                evaluation_path = cand
+                break
+
+        if evaluation and evaluation.filename:
+            e_ext = Path(evaluation.filename).suffix.lower()
+            if e_ext not in {".json", ".csv"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"El archivo evaluation debe ser .json o .csv (recibido '{evaluation.filename}').",
+                )
+            e_content = await evaluation.read()
+            if not e_content:
+                raise HTTPException(status_code=400, detail="El archivo evaluation subido está vacío.")
+            if e_ext == ".json":
+                try:
+                    e_data = json.loads(e_content.decode("utf-8"))
+                    if not isinstance(e_data, dict):
+                        raise ValueError("El evaluation debe ser un objeto JSON.")
+                    opts = e_data.get("options", {})
+                    q_list = opts.get("questions_in_order", [])
+                    if isinstance(q_list, list) and len(q_list) > 0:
+                        from src.utils.parsing import parse_fields
+                        parsed_qs = parse_fields("Questions", q_list)
+                        if len(parsed_qs) > settings.MAX_QUESTIONS:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"El examen no puede exceder el límite máximo de {settings.MAX_QUESTIONS} preguntas (recibido {len(parsed_qs)}).",
+                            )
+                        if len(parsed_qs) == 0:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="El archivo de evaluación debe contener al menos 1 pregunta.",
+                            )
+                except HTTPException:
+                    raise
+                except Exception as err:
+                    raise HTTPException(status_code=400, detail=f"Error al analizar evaluation.json: JSON inválido ({str(err)})")
+            evaluation_path = paths["root"] / f"evaluation{e_ext}"
+            with evaluation_path.open("wb") as buffer:
+                buffer.write(e_content)
 
     # 6. Configurar marcador de calibración y config.json
     target_marker = paths["root"] / "omr_marker.jpg"
@@ -473,14 +509,72 @@ async def process_omr_sheets(
     # 12. Guardar reportes consolidados (results.json, results.csv, results.xlsx)
     export_service.save_batch_results(batch_response, paths["results"])
 
+    # 13. Persistir en SQLite tabla jobs
+    try:
+        with get_db() as conn:
+            conn.execute("""
+            INSERT OR REPLACE INTO jobs (
+                job_id, exam_id, exam_name, user_id, user_name, user_email, user_role,
+                status, question_count, total_files, success_count, multi_marked_count,
+                incompletas_count, error_count, average_score, highest_score, lowest_score,
+                zip_count, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, (
+                actual_job_id,
+                clean_exam_id,
+                clean_exam_name,
+                current_user.id,
+                current_user.nombre,
+                current_user.correo,
+                current_user.role,
+                batch_response.status,
+                batch_response.question_count,
+                batch_response.total_files,
+                batch_response.success_count,
+                batch_response.multi_marked_count,
+                batch_response.incompletas_count,
+                batch_response.error_count,
+                batch_response.average_score,
+                batch_response.highest_score,
+                batch_response.lowest_score,
+                batch_response.zip_count,
+                batch_response.created_at,
+            ))
+    except Exception as db_err:
+        print(f"[DB Warning] Error al persistir job en SQLite: {db_err}")
+
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    log_audit(
+        action="PROCESS_OMR",
+        user_id=current_user.id,
+        user_name=current_user.nombre,
+        user_email=current_user.correo,
+        user_role=current_user.role,
+        target_id=actual_job_id,
+        details={
+            "exam_id": clean_exam_id,
+            "exam_name": clean_exam_name,
+            "total_files": batch_response.total_files,
+            "success_count": batch_response.success_count,
+            "error_count": batch_response.error_count,
+            "zip_count": batch_response.zip_count,
+        },
+        ip_address=client_ip,
+    )
+
     return batch_response
 
 
 @router.get("/jobs/{job_id}", response_model=JobSummaryResponse, tags=["OMR Jobs"])
-async def get_job_summary(job_id: str):
+async def get_job_summary(
+    job_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+):
     """
     Devuelve el estado general del trabajo OMR identificado por job_id.
+    Valida permisos de acceso según el rol del usuario.
     """
+    exam_service.verify_job_access(job_id, current_user)
     paths = storage_service.get_job_paths(job_id)
     if not paths["root"].exists():
         raise HTTPException(
@@ -554,10 +648,15 @@ async def get_job_summary(job_id: str):
 
 
 @router.get("/jobs/{job_id}/results", response_model=BatchProcessResponse, tags=["OMR Jobs"])
-async def get_job_results(job_id: str):
+async def get_job_results(
+    job_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+):
     """
     Devuelve los resultados estructurados completos contenidos en results.json.
+    Valida permisos de acceso según el rol del usuario.
     """
+    exam_service.verify_job_access(job_id, current_user)
     paths = storage_service.get_job_paths(job_id)
     if not paths["root"].exists():
         raise HTTPException(
@@ -585,10 +684,15 @@ async def get_job_results(job_id: str):
 
 
 @router.get("/jobs/{job_id}/files", response_model=JobFilesResponse, tags=["OMR Jobs"])
-async def get_job_processed_files(job_id: str):
+async def get_job_processed_files(
+    job_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+):
     """
     Devuelve las rutas, nombres y URLs de descarga/visualización de las imágenes procesadas.
+    Valida permisos de acceso según el rol del usuario.
     """
+    exam_service.verify_job_access(job_id, current_user)
     paths = storage_service.get_job_paths(job_id)
     if not paths["root"].exists():
         raise HTTPException(
@@ -622,11 +726,17 @@ async def get_job_processed_files(job_id: str):
 
 
 @router.get("/jobs/{job_id}/image/{filename}", tags=["OMR Jobs"])
-async def get_job_marked_image(job_id: str, filename: str):
+async def get_job_marked_image(
+    job_id: str,
+    filename: str,
+    current_user: UserResponse = Depends(get_current_user),
+):
     """
     Visualiza la imagen procesada con detecciones OMR (outputs/marked_...).
     Si la hoja falló y no existe imagen procesada, entrega la imagen original de entrada como fallback.
+    Valida permisos de acceso según el rol del usuario.
     """
+    exam_service.verify_job_access(job_id, current_user)
     paths = storage_service.get_job_paths(job_id)
     if not paths["root"].exists():
         raise HTTPException(
@@ -671,10 +781,16 @@ async def get_job_marked_image(job_id: str, filename: str):
 
 
 @router.get("/jobs/{job_id}/original-image/{filename}", tags=["OMR Jobs"])
-async def get_job_original_image(job_id: str, filename: str):
+async def get_job_original_image(
+    job_id: str,
+    filename: str,
+    current_user: UserResponse = Depends(get_current_user),
+):
     """
     Descarga o visualiza la imagen original cargada (inputs/), útil para inspeccionar hojas con ERROR.
+    Valida permisos de acceso según el rol del usuario.
     """
+    exam_service.verify_job_access(job_id, current_user)
     paths = storage_service.get_job_paths(job_id)
     if not paths["root"].exists():
         raise HTTPException(
@@ -706,10 +822,15 @@ async def get_job_original_image(job_id: str, filename: str):
 
 
 @router.get("/jobs/{job_id}/export/csv", tags=["OMR Export"])
-async def export_job_csv(job_id: str):
+async def export_job_csv(
+    job_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+):
     """
     Exporta los resultados del trabajo en formato CSV compatible con OMRChecker.
+    Valida permisos de acceso según el rol del usuario.
     """
+    exam_service.verify_job_access(job_id, current_user)
     paths = storage_service.get_job_paths(job_id)
     if not paths["root"].exists():
         raise HTTPException(
@@ -738,10 +859,15 @@ async def export_job_csv(job_id: str):
 
 
 @router.get("/jobs/{job_id}/export/excel", tags=["OMR Export"])
-async def export_job_excel(job_id: str):
+async def export_job_excel(
+    job_id: str,
+    current_user: UserResponse = Depends(get_current_user),
+):
     """
     Exporta los resultados del trabajo en formato Excel (.xlsx con openpyxl) con hojas 'Resultados' y 'Detalle'.
+    Valida permisos de acceso según el rol del usuario.
     """
+    exam_service.verify_job_access(job_id, current_user)
     paths = storage_service.get_job_paths(job_id)
     if not paths["root"].exists():
         raise HTTPException(
@@ -772,14 +898,17 @@ async def export_job_excel(job_id: str):
 @router.post("/jobs/{job_id}/retry", response_model=BatchProcessResponse, tags=["OMR Processing"])
 async def retry_job_with_corrected_zip(
     job_id: str,
+    request: Request,
     zip_file: UploadFile = File(..., description="Archivo .zip que contiene hojas OMR corregidas"),
-    current_user: Optional[UserResponse] = Depends(get_current_user_optional),
+    current_user: UserResponse = Depends(get_current_user),
 ):
     """
     Vuelve a procesar un conjunto de hojas corregidas sobre un examen existente.
     Conserva la configuración original (template, evaluación, puntos, nombre de examen).
     Actualiza los registros existentes sin duplicar los correctos.
+    Valida permisos de acceso según el rol del usuario.
     """
+    exam_service.verify_job_access(job_id, current_user)
     paths = storage_service.get_job_paths(job_id)
     if not paths["root"].exists():
         raise HTTPException(
@@ -900,20 +1029,17 @@ async def retry_job_with_corrected_zip(
         )
 
     # 7. Actualizar sin duplicar:
-    # Mapear los nuevos resultados por original_name
     new_results_map = {r.original_name: r for r in new_batch.results}
     merged_results = []
     updated_names = set()
 
     for old_r in current_batch.results:
         if old_r.original_name in new_results_map:
-            # Reemplazar el registro con el nuevo resultado (sea exitoso o con nuevo error)
             merged_results.append(new_results_map[old_r.original_name])
             updated_names.add(old_r.original_name)
         else:
             merged_results.append(old_r)
 
-    # Agregar archivos adicionales si no estaban en el lote original
     for name, r in new_results_map.items():
         if name not in updated_names:
             merged_results.append(r)
@@ -947,105 +1073,95 @@ async def retry_job_with_corrected_zip(
         except Exception:
             pass
 
+    # 11. Actualizar SQLite jobs table
+    try:
+        with get_db() as conn:
+            conn.execute("""
+            UPDATE jobs
+            SET status = ?, total_files = ?, success_count = ?, multi_marked_count = ?,
+                error_count = ?, average_score = ?, highest_score = ?, lowest_score = ?
+            WHERE job_id = ?;
+            """, (
+                current_batch.status,
+                current_batch.total_files,
+                current_batch.success_count,
+                current_batch.multi_marked_count,
+                current_batch.error_count,
+                current_batch.average_score,
+                current_batch.highest_score,
+                current_batch.lowest_score,
+                job_id,
+            ))
+    except Exception as db_err:
+        print(f"[DB Warning] Error al actualizar job en SQLite: {db_err}")
+
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    log_audit(
+        action="RETRY_OMR",
+        user_id=current_user.id,
+        user_name=current_user.nombre,
+        user_email=current_user.correo,
+        user_role=current_user.role,
+        target_id=job_id,
+        details={"status": current_batch.status, "error_count": current_batch.error_count},
+        ip_address=client_ip,
+    )
+
     return current_batch
 
 
 @router.get("/history", response_model=List[JobSummaryResponse], tags=["OMR Jobs"])
-@router.get("/exams", response_model=List[JobSummaryResponse], tags=["OMR Jobs"])
 @router.get("/jobs", response_model=List[JobSummaryResponse], tags=["OMR Jobs"])
 async def get_user_exam_history(
-    current_user: Optional[UserResponse] = Depends(get_current_user_optional),
+    current_user: UserResponse = Depends(get_current_user),
 ):
     """
-    Devuelve la lista de exámenes procesados correspondientes al usuario autenticado.
-    Si el examen no tiene usuario asignado (procesado anteriormente), también se incluye.
+    Devuelve la lista de exámenes procesados correspondientes al usuario autenticado según su rol:
+    - Admin: todo el historial global de evaluaciones.
+    - Editor: evaluaciones propias o asociadas a exámenes creados por este editor.
+    - Usuario: únicamente las evaluaciones realizadas por él mismo.
     """
     user_jobs: List[JobSummaryResponse] = []
-    jobs_dir = settings.JOBS_DIR
-    if not jobs_dir.exists():
-        return user_jobs
+    with get_db() as conn:
+        cursor = conn.cursor()
+        if current_user.role == "admin":
+            cursor.execute("SELECT * FROM jobs ORDER BY created_at DESC;")
+        elif current_user.role == "editor":
+            cursor.execute("""
+            SELECT * FROM jobs 
+            WHERE user_id = ? 
+               OR exam_id IN (SELECT id FROM exams WHERE creator_id = ?)
+            ORDER BY created_at DESC;
+            """, (current_user.id, current_user.id))
+        else:
+            cursor.execute("SELECT * FROM jobs WHERE user_id = ? ORDER BY created_at DESC;", (current_user.id,))
 
-    for job_dir in sorted(jobs_dir.iterdir(), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True):
-        if not job_dir.is_dir():
-            continue
-
-        job_id = job_dir.name
-        results_file = job_dir / "results" / "results.json"
-        job_info_file = job_dir / "job_info.json"
-
-        if results_file.exists():
-            try:
-                with results_file.open("r", encoding="utf-8") as f:
-                    data = json.load(f)
-
-                job_user_id = data.get("user_id")
-                # Si hay usuario autenticado: ocultar solo si pertenece a OTRO usuario diferente
-                if current_user and job_user_id and job_user_id != current_user.id:
-                    continue
-
-                q_cnt = data.get("question_count")
-                if not q_cnt and "results" in data and len(data["results"]) > 0:
-                    audits = data["results"][0].get("audits", [])
-                    q_cnt = len(audits) if audits else None
-
-                err_cnt = data.get("error_count", 0)
-                status_val = data.get("status", "completed")
-                if err_cnt > 0 and status_val == "completed":
-                    status_val = "completed_with_errors"
-
-                user_jobs.append(
-                    JobSummaryResponse(
-                        job_id=job_id,
-                        exam_name=data.get("exam_name", "Examen OMR"),
-                        question_count=q_cnt,
-                        status=status_val,
-                        created_at=data.get("created_at"),
-                        user_id=data.get("user_id"),
-                        user_email=data.get("user_email"),
-                        user_name=data.get("user_name"),
-                        total_files=data.get("total_files", 0),
-                        success_count=data.get("success_count", 0),
-                        multi_marked_count=data.get("multi_marked_count", 0),
-                        error_count=err_cnt,
-                        average_score=data.get("average_score", 0.0),
-                        highest_score=data.get("highest_score", 0.0),
-                        lowest_score=data.get("lowest_score", 0.0),
-                        zip_count=data.get("zip_count", len(data.get("zips_summary", [])) or 1),
-                        zips_summary=data.get("zips_summary"),
-                        has_results=True,
-                        has_outputs=True,
-                        input_files_count=data.get("total_files", 0),
-                        processed_images_count=data.get("total_files", 0),
-                    )
+        rows = cursor.fetchall()
+        for r in rows:
+            user_jobs.append(
+                JobSummaryResponse(
+                    job_id=r["job_id"],
+                    exam_name=r["exam_name"],
+                    question_count=r["question_count"],
+                    status=r["status"],
+                    created_at=r["created_at"],
+                    user_id=r["user_id"],
+                    user_email=r["user_email"],
+                    user_name=r["user_name"],
+                    total_files=r["total_files"],
+                    success_count=r["success_count"],
+                    multi_marked_count=r["multi_marked_count"],
+                    error_count=r["error_count"],
+                    average_score=r["average_score"],
+                    highest_score=r["highest_score"],
+                    lowest_score=r["lowest_score"],
+                    zip_count=r["zip_count"],
+                    has_results=True,
+                    has_outputs=True,
+                    input_files_count=r["total_files"],
+                    processed_images_count=r["total_files"],
                 )
-            except Exception:
-                continue
-        elif job_info_file.exists():
-            try:
-                with job_info_file.open("r", encoding="utf-8") as f:
-                    data = json.load(f)
-
-                job_user_id = data.get("user_id")
-                if current_user and job_user_id and job_user_id != current_user.id:
-                    continue
-
-                user_jobs.append(
-                    JobSummaryResponse(
-                        job_id=job_id,
-                        exam_name=data.get("exam_name", "Examen OMR"),
-                        question_count=data.get("question_count"),
-                        status=data.get("status", "processing"),
-                        created_at=data.get("created_at"),
-                        user_id=data.get("user_id"),
-                        user_email=data.get("user_email"),
-                        user_name=data.get("user_name"),
-                        total_files=0,
-                        has_results=False,
-                        has_outputs=False,
-                    )
-                )
-            except Exception:
-                continue
+            )
 
     return user_jobs
 
