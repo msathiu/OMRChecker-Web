@@ -12,3 +12,8 @@ outputs/*
 **/__pycache__
 venv/
 OMRChecker.wiki/
+
+# Datos locales de usuarios y sesiones
+storage/users/sessions.json
+storage/users/users.json
+storage/omr_web.db
