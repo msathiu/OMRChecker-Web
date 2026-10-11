@@ -19,6 +19,14 @@ export default function Header({ title }) {
     return () => { mounted = false; };
   }, []);
 
+  const role = user?.role || 'usuario';
+  let roleBadge = { text: 'Usuario', bg: '#f1f5f9', color: '#475569' };
+  if (role === 'admin') {
+    roleBadge = { text: 'Administrador', bg: '#ede9fe', color: '#6d28d9' };
+  } else if (role === 'editor') {
+    roleBadge = { text: 'Editor', bg: '#e0f2fe', color: '#0369a1' };
+  }
+
   return (
     <header className="header">
       <h1 className="header-title">{title}</h1>
@@ -53,9 +61,23 @@ export default function Header({ title }) {
             }}
           >
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', lineHeight: 1.2 }}>
-              <span style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-main)' }}>
-                {user.nombre}
-              </span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                <span style={{ fontSize: '0.85rem', fontWeight: 600, color: 'var(--text-main)' }}>
+                  {user.nombre}
+                </span>
+                <span
+                  style={{
+                    padding: '0.1rem 0.45rem',
+                    borderRadius: '999px',
+                    fontSize: '0.65rem',
+                    fontWeight: 600,
+                    background: roleBadge.bg,
+                    color: roleBadge.color,
+                  }}
+                >
+                  {roleBadge.text}
+                </span>
+              </div>
               <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
                 {user.correo}
               </span>

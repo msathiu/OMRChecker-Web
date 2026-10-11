@@ -16,11 +16,13 @@ import DashboardPage from './pages/DashboardPage';
 import ProcessPage from './pages/ProcessPage';
 import ResultsPage from './pages/ResultsPage';
 import HistoryPage from './pages/HistoryPage';
+import ExamsPage from './pages/ExamsPage';
+import UsersManagementPage from './pages/UsersManagementPage';
 
 import { AuthProvider, useAuth } from './context/AuthContext';
 
-function ProtectedRoute({ children }) {
-  const { isAuthenticated, isLoading } = useAuth();
+function ProtectedRoute({ children, allowedRoles }) {
+  const { user, isAuthenticated, isLoading } = useAuth();
   const location = useLocation();
 
   if (isLoading) {
@@ -41,6 +43,10 @@ function ProtectedRoute({ children }) {
     );
   }
 
+  if (allowedRoles && user && !allowedRoles.includes(user.role)) {
+    return <Navigate to="/dashboard" replace />;
+  }
+
   return children;
 }
 
@@ -54,6 +60,14 @@ function AppLayout() {
 
     if (location.pathname.startsWith('/process')) {
       return 'Nuevo Procesamiento de Examen';
+    }
+
+    if (location.pathname.startsWith('/exams')) {
+      return 'Gestión de Exámenes y Pautas';
+    }
+
+    if (location.pathname.startsWith('/admin/users')) {
+      return 'Administración de Usuarios';
     }
 
     if (location.pathname.startsWith('/history')) {
@@ -78,6 +92,20 @@ function AppLayout() {
           <Route
             path="/dashboard"
             element={<DashboardPage />}
+          />
+
+          <Route
+            path="/exams"
+            element={<ExamsPage />}
+          />
+
+          <Route
+            path="/admin/users"
+            element={
+              <ProtectedRoute allowedRoles={['admin']}>
+                <UsersManagementPage />
+              </ProtectedRoute>
+            }
           />
 
           <Route

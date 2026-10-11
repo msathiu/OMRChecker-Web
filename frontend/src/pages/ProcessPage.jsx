@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import React, { useEffect, useState } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
   FileArchive,
   ArrowRight,
@@ -11,14 +11,23 @@ import {
   CheckCircle2,
   Trash2,
   Clock,
+  FileText,
 } from 'lucide-react';
 import { api } from '../services/api';
+import { useAuth } from '../context/AuthContext';
 
 const MAX_QUESTIONS = 40;
 const DEFAULT_OPTIONS = ['A', 'B', 'C', 'D', 'E'];
 
 export default function ProcessPage() {
+  const { user } = useAuth();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const initialExamId = searchParams.get('examId') || '';
+
+  const [availableExams, setAvailableExams] = useState([]);
+  const [selectedExamId, setSelectedExamId] = useState(initialExamId);
+  const [loadingExams, setLoadingExams] = useState(true);
 
   // 1. Nombre del Examen
   const [examName, setExamName] = useState('');
@@ -51,6 +60,74 @@ export default function ProcessPage() {
   const [isConfigLocked, setIsConfigLocked] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [processError, setProcessError] = useState('');
+
+  // Cargar exámenes asignados / disponibles
+  useEffect(() => {
+    let isMounted = true;
+    async function loadExams() {
+      setLoadingExams(true);
+      try {
+        const exams = await api.getExams();
+        if (isMounted) {
+          const list = Array.isArray(exams) ? exams : [];
+          setAvailableExams(list);
+          if (initialExamId) {
+            const matched = list.find((e) => e.id === initialExamId);
+            if (matched) {
+              setSelectedExamId(matched.id);
+              setExamName(matched.name);
+              if (matched.question_count) setQuestionCount(matched.question_count);
+              if (matched.scoring_mode) setScoringMode(matched.scoring_mode);
+              if (matched.equal_points) setEqualPoints(String(matched.equal_points));
+              if (matched.answers && user?.role !== 'usuario') {
+                setAnswers(matched.answers);
+              }
+              if (matched.specific_points && user?.role !== 'usuario') {
+                setSpecificPoints(matched.specific_points);
+              }
+            }
+          } else if (list.length > 0 && user?.role === 'usuario') {
+            const first = list[0];
+            setSelectedExamId(first.id);
+            setExamName(first.name);
+            if (first.question_count) setQuestionCount(first.question_count);
+          }
+        }
+      } catch (err) {
+        console.error('Error al cargar exámenes disponibles:', err);
+      } finally {
+        if (isMounted) setLoadingExams(false);
+      }
+    }
+    loadExams();
+    return () => {
+      isMounted = false;
+    };
+  }, [initialExamId, user]);
+
+  const handleSelectExam = (e) => {
+    const id = e.target.value;
+    setSelectedExamId(id);
+    const matched = availableExams.find((ex) => ex.id === id);
+    if (matched) {
+      setExamName(matched.name);
+      setExamNameError('');
+      if (matched.question_count) setQuestionCount(matched.question_count);
+      if (matched.scoring_mode) setScoringMode(matched.scoring_mode);
+      if (matched.equal_points) setEqualPoints(String(matched.equal_points));
+      if (matched.answers && user?.role !== 'usuario') {
+        setAnswers(matched.answers);
+      }
+      if (matched.specific_points && user?.role !== 'usuario') {
+        setSpecificPoints(matched.specific_points);
+      }
+    } else {
+      setSelectedExamId('');
+      if (user?.role !== 'usuario') {
+        setExamName('');
+      }
+    }
+  };
 
   // Manejador de cambio de cantidad de preguntas (Límite estricto 1 a 40)
   const handleQuestionCountChange = (count) => {
@@ -172,11 +249,20 @@ export default function ProcessPage() {
 
     if (isProcessing) return;
 
-    // Validación 1: Nombre del examen
-    const cleanExamName = examName.trim();
-    if (!cleanExamName) {
-      setExamNameError('El nombre del examen es obligatorio.');
-      return;
+    const isNormalUser = user?.role === 'usuario';
+
+    // Validación 1: Selección o nombre del examen
+    if (isNormalUser) {
+      if (!selectedExamId) {
+        setExamNameError('Debes seleccionar un examen asignado para realizar el procesamiento.');
+        return;
+      }
+    } else {
+      const cleanExamName = examName.trim();
+      if (!cleanExamName && !selectedExamId) {
+        setExamNameError('El nombre del examen es obligatorio.');
+        return;
+      }
     }
     setExamNameError('');
 
@@ -187,56 +273,46 @@ export default function ProcessPage() {
     }
     setZipError('');
 
-    // Validación 3: Todas las preguntas deben tener respuesta asignada
-    const missing = [];
-    for (let i = 1; i <= questionCount; i++) {
-      if (!answers[i]) missing.push(i);
-    }
+    let evalBlob = null;
 
-    if (missing.length > 0) {
-      setValidationError(
-        `Faltan respuestas por asignar en ${missing.length} pregunta(s): ${missing.slice(0, 5).map((n) => `P${n}`).join(', ')}${missing.length > 5 ? '...' : ''}`
-      );
-      return;
-    }
+    // Para editores/admins sin examen guardado previo, validar respuestas y puntos manuales
+    if (!isNormalUser && !selectedExamId) {
+      // Validación 3: Todas las preguntas deben tener respuesta asignada
+      const missing = [];
+      for (let i = 1; i <= questionCount; i++) {
+        if (!answers[i]) missing.push(i);
+      }
 
-    // Validación 4: Validación de puntos numéricos válidos (> 0, enteros o decimales)
-    if (scoringMode === 'EQUAL') {
-      const eq = parseFloat(equalPoints);
-      if (isNaN(eq) || eq <= 0) {
-        setValidationError('La puntuación por pregunta debe ser un número positivo mayor a 0 (ej. 1, 0.25, 1.75).');
+      if (missing.length > 0) {
+        setValidationError(
+          `Faltan respuestas por asignar en ${missing.length} pregunta(s): ${missing.slice(0, 5).map((n) => `P${n}`).join(', ')}${missing.length > 5 ? '...' : ''}`
+        );
         return;
       }
-    } else {
-      for (let i = 1; i <= questionCount; i++) {
-        const raw = specificPoints[i];
-        if (raw === undefined || raw === null || String(raw).trim() === '') {
-          setValidationError(`Falta asignar puntuación a la pregunta P${i}.`);
+
+      // Validación 4: Validación de puntos numéricos válidos (> 0, enteros o decimales)
+      if (scoringMode === 'EQUAL') {
+        const eq = parseFloat(equalPoints);
+        if (isNaN(eq) || eq <= 0) {
+          setValidationError('La puntuación por pregunta debe ser un número positivo mayor a 0 (ej. 1, 0.25, 1.75).');
           return;
         }
-        const pt = parseFloat(raw);
-        if (isNaN(pt) || pt <= 0) {
-          setValidationError(`La puntuación de la pregunta P${i} debe ser un número positivo mayor a 0 (ej. 0.25, 1.5, 2.75).`);
-          return;
+      } else {
+        for (let i = 1; i <= questionCount; i++) {
+          const raw = specificPoints[i];
+          if (raw === undefined || raw === null || String(raw).trim() === '') {
+            setValidationError(`Falta asignar puntuación a la pregunta P${i}.`);
+            return;
+          }
+          const pt = parseFloat(raw);
+          if (isNaN(pt) || pt <= 0) {
+            setValidationError(`La puntuación de la pregunta P${i} debe ser un número positivo mayor a 0 (ej. 0.25, 1.5, 2.75).`);
+            return;
+          }
         }
       }
-    }
 
-    setValidationError('');
-    setProcessError('');
-
-    // Inicializar estado de progreso para cada archivo ZIP
-    const initialStatuses = zipFiles.map((f, i) => ({
-      name: f.name,
-      size: f.size,
-      status: i === 0 ? 'processing' : 'pending',
-      error: null,
-    }));
-    setZipStatuses(initialStatuses);
-    setIsProcessing(true);
-
-    try {
-      // 1. Construir objeto de evaluación equivalente a evaluation.json
+      // Construir objeto de evaluación equivalente a evaluation.json
       const questionsInOrder = [];
       const answersInOrder = [];
 
@@ -287,12 +363,25 @@ export default function ProcessPage() {
         marking_schemes: markingSchemes,
       };
 
-      // 2. Generar Blob de evaluation.json
-      const evalBlob = new Blob([JSON.stringify(evaluationObject, null, 2)], {
+      evalBlob = new Blob([JSON.stringify(evaluationObject, null, 2)], {
         type: 'application/json',
       });
+    }
 
-      // 3. Procesamiento secuencial controlado de los archivos ZIP
+    setValidationError('');
+    setProcessError('');
+
+    // Inicializar estado de progreso para cada archivo ZIP
+    const initialStatuses = zipFiles.map((f, i) => ({
+      name: f.name,
+      size: f.size,
+      status: i === 0 ? 'processing' : 'pending',
+      error: null,
+    }));
+    setZipStatuses(initialStatuses);
+    setIsProcessing(true);
+
+    try {
       let currentJobId = null;
       let hasAnySuccess = false;
 
@@ -306,8 +395,14 @@ export default function ProcessPage() {
         formData.append('zip_files', file);
 
         if (!currentJobId) {
-          formData.append('exam_name', cleanExamName);
-          formData.append('evaluation', evalBlob, 'evaluation.json');
+          if (selectedExamId) {
+            formData.append('exam_id', selectedExamId);
+          } else {
+            formData.append('exam_name', examName.trim() || 'Examen OMR');
+            if (evalBlob) {
+              formData.append('evaluation', evalBlob, 'evaluation.json');
+            }
+          }
         } else {
           formData.append('job_id', currentJobId);
         }
@@ -462,41 +557,46 @@ export default function ProcessPage() {
       )}
 
       {/* Encabezado de la página */}
+      {/* Encabezado de la página */}
       <div style={{ marginBottom: '1.75rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>
         <div>
           <h2 style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--text-main)', marginBottom: '0.25rem' }}>
-            Nuevo Procesamiento OMR
+            {user?.role === 'usuario' ? 'Subir y Procesar Examen' : 'Nuevo Procesamiento OMR'}
           </h2>
           <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
-            Asigna el nombre, carga el archivo ZIP y configura la clave de respuestas y puntuación.
+            {user?.role === 'usuario'
+              ? 'Selecciona tu examen asignado y sube las hojas escaneadas en formato ZIP.'
+              : 'Asigna el nombre, carga el archivo ZIP y configura la clave de respuestas y puntuación.'}
           </p>
         </div>
 
-        {/* Candado interactivo en el encabezado principal */}
-        <button
-          type="button"
-          onClick={() => setIsConfigLocked(!isConfigLocked)}
-          disabled={isProcessing}
-          style={{
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: '0.45rem',
-            backgroundColor: isConfigLocked ? '#fef3c7' : '#ffffff',
-            color: isConfigLocked ? '#b45309' : '#475569',
-            padding: '0.45rem 0.95rem',
-            borderRadius: 'var(--radius-sm)',
-            fontWeight: 600,
-            fontSize: '0.875rem',
-            border: isConfigLocked ? '1px solid #f59e0b' : '1px solid var(--border)',
-            cursor: isProcessing ? 'not-allowed' : 'pointer',
-            boxShadow: 'var(--shadow-sm)',
-            transition: 'all 0.15s ease',
-          }}
-          title={isConfigLocked ? 'Configuración bloqueada. Haz clic para desbloquear y permitir cambios.' : 'Configuración editable. Haz clic para bloquear y proteger de cambios accidentales.'}
-        >
-          {isConfigLocked ? <Lock size={16} color="#b45309" /> : <Unlock size={16} color="#64748b" />}
-          <span>{isConfigLocked ? '🔒 Configuración Bloqueada' : '🔓 Configuración Desbloqueada'}</span>
-        </button>
+        {/* Candado interactivo en el encabezado principal (solo para editor y admin) */}
+        {user?.role !== 'usuario' && (
+          <button
+            type="button"
+            onClick={() => setIsConfigLocked(!isConfigLocked)}
+            disabled={isProcessing}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '0.45rem',
+              backgroundColor: isConfigLocked ? '#fef3c7' : '#ffffff',
+              color: isConfigLocked ? '#b45309' : '#475569',
+              padding: '0.45rem 0.95rem',
+              borderRadius: 'var(--radius-sm)',
+              fontWeight: 600,
+              fontSize: '0.875rem',
+              border: isConfigLocked ? '1px solid #f59e0b' : '1px solid var(--border)',
+              cursor: isProcessing ? 'not-allowed' : 'pointer',
+              boxShadow: 'var(--shadow-sm)',
+              transition: 'all 0.15s ease',
+            }}
+            title={isConfigLocked ? 'Configuración bloqueada. Haz clic para desbloquear y permitir cambios.' : 'Configuración editable. Haz clic para bloquear y proteger de cambios accidentales.'}
+          >
+            {isConfigLocked ? <Lock size={16} color="#b45309" /> : <Unlock size={16} color="#64748b" />}
+            <span>{isConfigLocked ? '🔒 Configuración Bloqueada' : '🔓 Configuración Desbloqueada'}</span>
+          </button>
+        )}
       </div>
 
       {processError && (
@@ -535,35 +635,110 @@ export default function ProcessPage() {
             <h3 style={{ fontSize: '1.15rem', fontWeight: 600 }}>Información del Examen y Archivo ZIP</h3>
           </div>
 
-          {/* NOMBRE DEL EXAMEN */}
-          <div style={{ marginBottom: '1.5rem' }}>
-            <label style={{ display: 'block', fontWeight: 600, fontSize: '0.9rem', marginBottom: '0.4rem', color: 'var(--text-main)' }}>
-              Nombre del examen <span style={{ color: 'var(--danger)' }}>*</span>
-            </label>
-            <input
-              type="text"
-              placeholder="Ejemplo: Prueba de selección Ingeniería 2026"
-              value={examName}
-              onChange={(e) => {
-                if (isProcessing) return;
-                setExamName(e.target.value);
-                setExamNameError('');
-              }}
-              disabled={isProcessing}
-              className="form-input"
-              style={{
-                width: '100%',
-                padding: '0.65rem 0.85rem',
-                fontSize: '0.95rem',
-                borderColor: examNameError ? 'var(--danger)' : undefined,
-              }}
-            />
-            {examNameError && (
-              <div style={{ color: 'var(--danger)', fontSize: '0.825rem', marginTop: '0.35rem' }}>
-                {examNameError}
+          {/* SELECCIÓN DE EXAMEN */}
+          {user?.role === 'usuario' ? (
+            <div style={{ marginBottom: '1.5rem' }}>
+              <label style={{ display: 'block', fontWeight: 600, fontSize: '0.9rem', marginBottom: '0.4rem', color: 'var(--text-main)' }}>
+                Examen Asignado <span style={{ color: 'var(--danger)' }}>*</span>
+              </label>
+              {loadingExams ? (
+                <div style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>Cargando tus exámenes asignados...</div>
+              ) : availableExams.length === 0 ? (
+                <div style={{ padding: '1rem', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 'var(--radius-md)', color: '#991b1b', fontSize: '0.875rem' }}>
+                  <strong>Todavía no tienes exámenes asignados.</strong>
+                  <p style={{ margin: '0.25rem 0 0 0', fontSize: '0.825rem', color: '#b91c1c' }}>
+                    Un profesor o editor debe asignarte un examen antes de que puedas subir hojas de respuestas.
+                  </p>
+                </div>
+              ) : (
+                <>
+                  <select
+                    value={selectedExamId}
+                    onChange={handleSelectExam}
+                    disabled={isProcessing}
+                    className="form-control"
+                    style={{ width: '100%', padding: '0.65rem 0.85rem', fontSize: '0.95rem' }}
+                  >
+                    {availableExams.map((ex) => (
+                      <option key={ex.id} value={ex.id}>
+                        {ex.name} — {ex.creator_name || 'Profesor'} ({ex.question_count} preguntas)
+                      </option>
+                    ))}
+                  </select>
+                  {(() => {
+                    const matched = availableExams.find((ex) => ex.id === selectedExamId);
+                    if (!matched) return null;
+                    return (
+                      <div style={{ marginTop: '0.5rem', padding: '0.65rem 0.85rem', background: '#f8fafc', borderRadius: 'var(--radius-sm)', border: '1px solid #e2e8f0', fontSize: '0.825rem', color: 'var(--text-muted)', display: 'flex', gap: '1.5rem', flexWrap: 'wrap' }}>
+                        <span><strong>Preguntas:</strong> {matched.question_count}</span>
+                        <span><strong>Profesor:</strong> {matched.creator_name}</span>
+                        <span><strong>Puntuación:</strong> {matched.scoring_mode === 'EQUAL' ? `${matched.equal_points} pts/pregunta` : 'Específica'}</span>
+                      </div>
+                    );
+                  })()}
+                </>
+              )}
+              {examNameError && (
+                <div style={{ color: 'var(--danger)', fontSize: '0.825rem', marginTop: '0.35rem' }}>
+                  {examNameError}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div style={{ marginBottom: '1.5rem' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem', flexWrap: 'wrap', gap: '0.5rem' }}>
+                <label style={{ fontWeight: 600, fontSize: '0.9rem', color: 'var(--text-main)', margin: 0 }}>
+                  Nombre del examen <span style={{ color: 'var(--danger)' }}>*</span>
+                </label>
+                {availableExams.length > 0 && (
+                  <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                    O cargar examen existente:
+                  </span>
+                )}
               </div>
-            )}
-          </div>
+              {availableExams.length > 0 && (
+                <div style={{ marginBottom: '0.5rem' }}>
+                  <select
+                    value={selectedExamId}
+                    onChange={handleSelectExam}
+                    disabled={isProcessing}
+                    className="form-control"
+                    style={{ width: '100%', padding: '0.45rem 0.75rem', fontSize: '0.85rem' }}
+                  >
+                    <option value="">-- Configuración personalizada manual --</option>
+                    {availableExams.map((ex) => (
+                      <option key={ex.id} value={ex.id}>
+                        Cargar: {ex.name} ({ex.question_count} preguntas)
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              <input
+                type="text"
+                placeholder="Ejemplo: Prueba de selección Ingeniería 2026"
+                value={examName}
+                onChange={(e) => {
+                  if (isProcessing) return;
+                  setExamName(e.target.value);
+                  setExamNameError('');
+                }}
+                disabled={isProcessing}
+                className="form-input"
+                style={{
+                  width: '100%',
+                  padding: '0.65rem 0.85rem',
+                  fontSize: '0.95rem',
+                  borderColor: examNameError ? 'var(--danger)' : undefined,
+                }}
+              />
+              {examNameError && (
+                <div style={{ color: 'var(--danger)', fontSize: '0.825rem', marginTop: '0.35rem' }}>
+                  {examNameError}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Carga de archivos ZIP múltiples */}
           <label className="dropzone-container" style={{ display: 'block', cursor: isProcessing ? 'not-allowed' : 'pointer' }}>
@@ -664,8 +839,33 @@ export default function ProcessPage() {
           )}
         </div>
 
-        {/* PASO 2: Configuración de Puntuación */}
-        <div className="card" style={{ marginBottom: '1.5rem' }}>
+        {user?.role === 'usuario' ? (
+          <div className="card" style={{ marginBottom: '1.5rem', background: '#f8fafc', border: '1px solid #e2e8f0', padding: '1.5rem' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.65rem', marginBottom: '0.65rem' }}>
+              <div style={{
+                width: '32px',
+                height: '32px',
+                borderRadius: '50%',
+                background: '#e0e7ff',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                color: 'var(--primary)'
+              }}>
+                <Lock size={18} />
+              </div>
+              <h3 style={{ fontSize: '1.1rem', fontWeight: 600, margin: 0, color: 'var(--text-main)' }}>
+                Pauta de Evaluación y Puntuación Protegida
+              </h3>
+            </div>
+            <p style={{ margin: 0, fontSize: '0.875rem', color: 'var(--text-muted)', lineHeight: 1.5 }}>
+              La clave de respuestas correctas y el esquema de puntuación han sido configurados y custodiados por el profesor o editor de este examen en la base de datos del sistema. Al subir y procesar tus archivos ZIP, el motor aplicará de manera automática y confidencial la evaluación oficial establecida.
+            </p>
+          </div>
+        ) : (
+          <>
+            {/* PASO 2: Configuración de Puntuación */}
+            <div className="card" style={{ marginBottom: '1.5rem' }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '1rem' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
               <div style={{
@@ -1037,6 +1237,8 @@ export default function ProcessPage() {
             </div>
           </div>
         </div>
+          </>
+        )}
 
         {/* Botón de acción principal */}
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '1rem' }}>
@@ -1049,10 +1251,10 @@ export default function ProcessPage() {
               display: 'flex',
               alignItems: 'center',
               gap: '0.65rem',
-              opacity: isProcessing ? 0.75 : 1,
-              cursor: isProcessing ? 'not-allowed' : 'pointer',
+              opacity: isProcessing || (user?.role === 'usuario' && availableExams.length === 0) ? 0.6 : 1,
+              cursor: isProcessing || (user?.role === 'usuario' && availableExams.length === 0) ? 'not-allowed' : 'pointer',
             }}
-            disabled={isProcessing}
+            disabled={isProcessing || (user?.role === 'usuario' && availableExams.length === 0)}
           >
             {isProcessing ? (
               <>

@@ -29,16 +29,44 @@ async function handleResponse(response) {
         errorDetail = errorData.detail;
       } else if (Array.isArray(errorData.detail)) {
         // Errores de validación estructurados de FastAPI: [{ loc, msg, type }]
-        errorDetail = errorData.detail
+        const fieldLabels = {
+          nombre: 'El nombre completo',
+          name: 'El nombre completo',
+          correo: 'El correo electrónico',
+          email: 'El correo electrónico',
+          clave: 'La contraseña',
+          password: 'La contraseña',
+          confirmacion_clave: 'La confirmación de contraseña',
+          password_confirmation: 'La confirmación de contraseña',
+          role: 'El rol',
+        };
+
+        const messages = errorData.detail
           .map((item) => {
             if (typeof item === 'string') return item;
-            if (item && item.msg) {
-              return item.msg.replace(/^Value error,\s*/i, '');
+            if (item && typeof item === 'object') {
+              const field = Array.isArray(item.loc) && item.loc.length > 0
+                ? String(item.loc[item.loc.length - 1])
+                : '';
+              const label = fieldLabels[field] || (field ? `El campo "${field}"` : 'El campo');
+              const rawMsg = (item.msg || '').replace(/^Value error,\s*/i, '').trim();
+
+              if (item.type === 'missing' || rawMsg.toLowerCase() === 'field required') {
+                return `${label} es obligatorio.`;
+              }
+              if (item.type === 'string_too_short' || rawMsg.toLowerCase().includes('at least')) {
+                return `${label} debe tener al menos 6 caracteres.`;
+              }
+              if (rawMsg) {
+                return rawMsg.endsWith('.') ? rawMsg : `${rawMsg}.`;
+              }
+              return `${label} es inválido.`;
             }
             return '';
           })
-          .filter(Boolean)
-          .join('. ');
+          .filter(Boolean);
+
+        errorDetail = messages.join(' ') || (errorData.message || 'Error de validación en los datos enviados.');
       } else if (errorData.message && typeof errorData.message === 'string') {
         errorDetail = errorData.message;
       } else if (errorData.detail && typeof errorData.detail === 'object') {
@@ -270,5 +298,138 @@ export const api = {
     link.click();
     document.body.removeChild(link);
     window.URL.revokeObjectURL(downloadUrl);
+  },
+
+  /**
+   * ==========================================
+   * GESTIÓN DE EXÁMENES (RBAC)
+   * ==========================================
+   */
+  async getExams() {
+    const res = await fetch(`${API_BASE}/exams`, {
+      headers: getAuthHeaders(),
+    });
+    return handleResponse(res);
+  },
+
+  async getExam(examId) {
+    const res = await fetch(`${API_BASE}/exams/${examId}`, {
+      headers: getAuthHeaders(),
+    });
+    return handleResponse(res);
+  },
+
+  async createExam(examData) {
+    const res = await fetch(`${API_BASE}/exams`, {
+      method: 'POST',
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(examData),
+    });
+    return handleResponse(res);
+  },
+
+  async updateExam(examId, examData) {
+    const res = await fetch(`${API_BASE}/exams/${examId}`, {
+      method: 'PUT',
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(examData),
+    });
+    return handleResponse(res);
+  },
+
+  async deleteExam(examId) {
+    const res = await fetch(`${API_BASE}/exams/${examId}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    return handleResponse(res);
+  },
+
+  async assignExam(examId, userIds) {
+    const res = await fetch(`${API_BASE}/exams/${examId}/assign`, {
+      method: 'POST',
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ user_ids: userIds }),
+    });
+    return handleResponse(res);
+  },
+
+  async getExamAssignments(examId) {
+    const res = await fetch(`${API_BASE}/exams/${examId}/assignments`, {
+      headers: getAuthHeaders(),
+    });
+    return handleResponse(res);
+  },
+
+  async unassignExam(examId, userId) {
+    const res = await fetch(`${API_BASE}/exams/${examId}/assignments/${userId}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    return handleResponse(res);
+  },
+
+  /**
+   * ==========================================
+   * GESTIÓN DE USUARIOS (ROL ADMIN)
+   * ==========================================
+   */
+  async getUsers() {
+    const res = await fetch(`${API_BASE}/users`, {
+      headers: getAuthHeaders(),
+    });
+    return handleResponse(res);
+  },
+
+  async createUser(userData) {
+    const res = await fetch(`${API_BASE}/users`, {
+      method: 'POST',
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(userData),
+    });
+    return handleResponse(res);
+  },
+
+  async updateUser(userId, userData) {
+    const res = await fetch(`${API_BASE}/users/${userId}`, {
+      method: 'PUT',
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(userData),
+    });
+    return handleResponse(res);
+  },
+
+  async deleteUser(userId) {
+    const res = await fetch(`${API_BASE}/users/${userId}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    return handleResponse(res);
+  },
+
+  async getUserActivity(userId) {
+    const res = await fetch(`${API_BASE}/users/${userId}/activity`, {
+      headers: getAuthHeaders(),
+    });
+    return handleResponse(res);
+  },
+
+  /**
+   * ==========================================
+   * PANEL GLOBAL ADMINISTRADOR
+   * ==========================================
+   */
+  async getAdminStats() {
+    const res = await fetch(`${API_BASE}/admin/stats`, {
+      headers: getAuthHeaders(),
+    });
+    return handleResponse(res);
+  },
+
+  async getAuditLogs(limit = 100) {
+    const res = await fetch(`${API_BASE}/admin/audit-logs?limit=${limit}`, {
+      headers: getAuthHeaders(),
+    });
+    return handleResponse(res);
   },
 };
